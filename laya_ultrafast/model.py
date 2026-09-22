@@ -8,15 +8,16 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .questions import GOAL_PLAN, NEXT_ACTION, TARGET, TEXT_VALUE
+from .questions import GOAL_PLAN, NEXT_ACTION, STEP_PLAN, STEP_TARGET, TAB_SPLIT, TAB_STEPS, TARGET, TEXT_VALUE
 
 CLIENT = httpx.Client(http2=True, timeout=25)
 
 
-def post_json(url, key, body):
+def post_json(url, key, body, timeout=None):
     for attempt in range(3):
         try:
-            response = CLIENT.post(url, json=body, headers={"Authorization": f"Bearer {key}"})
+            response = CLIENT.post(url, json=body, headers={"Authorization": f"Bearer {key}"},
+                                   **({"timeout": timeout} if timeout else {}))
         except httpx.HTTPError:
             raise RuntimeError("Model connection failed; no action executed.") from None
         if response.status_code in {429, 529, 503} and attempt < 2:
@@ -162,7 +163,7 @@ def local_endpoint(base):
     return urlparse(base).hostname in {"localhost", "127.0.0.1", "::1"}
 
 
-def chat_json(system, context):
+def chat_json(system, context, max_tokens=1024, timeout=None):
     """One JSON-mode call to the OpenAI-compatible text model. Local servers need no key."""
     base = os.environ.get("TEXT_MODEL_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
     key = os.environ.get("TEXT_MODEL_API_KEY")
@@ -183,12 +184,13 @@ def chat_json(system, context):
         key or "local",
         {
             "model": model,
-            "max_tokens": 1024,
+            "max_tokens": max_tokens,
             "temperature": 0,
             "response_format": {"type": "json_object"},
             **reasoning,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": json.dumps(context)}],
         },
+        timeout,
     )
     output = json.loads(result["choices"][0]["message"]["content"])
     return output, {
@@ -217,10 +219,22 @@ def plan_goal(goal, fields=(), attempts=3):
     context = {"goal": goal, "fields_on_page": list(fields)[:40]}
     for attempt in range(attempts):
         try:
-            return parse_plan(*chat_json(GOAL_PLAN, context))
+            plan, meta = parse_plan(*chat_json(GOAL_PLAN, context))
+            break
         except ValueError as error:
             if "TEXT_MODEL_API_KEY" in str(error) or attempt == attempts - 1:
                 raise
+    if plan["requirements"] or plan["open"]:
+        return plan, meta
+    # Nothing to fill and nothing to open: the goal is about using controls ("open the chat, start a call").
+    # One more call lists them as ordered steps. Any failure keeps the plain plan.
+    try:
+        output, step_meta = chat_json(STEP_PLAN, context)
+        plan["steps"] = parse_steps(output.get("steps"))
+        meta = {**meta, "latency_ms": meta["latency_ms"] + step_meta["latency_ms"], "calls": 2}
+    except (ValueError, RuntimeError, KeyError, TypeError, AttributeError):
+        pass
+    return plan, meta
 
 
 def parse_plan(output, meta):
@@ -234,6 +248,76 @@ def parse_plan(output, meta):
         if not isinstance(finish, str) or not finish.strip() or len(requirements) > 12:
             raise ValueError()
         item = item.strip() if isinstance(item, str) and item.strip() else None
+        steps = parse_steps(output.get("steps"))
     except (ValueError, KeyError, TypeError, AttributeError):
         raise ValueError("Goal planner returned no valid plan; no action executed.") from None
-    return {"requirements": requirements, "open": item, "finish": finish.strip()}, meta
+    return {"requirements": requirements, "open": item, "finish": finish.strip(), "steps": steps}, meta
+
+
+def parse_steps(steps, tabs=None, limit=12):
+    """Ordered steps on page controls: what to do, the labels its control likely shows, and any text to type.
+    With `tabs`, each step also names its tab (one of `tabs`, else None: the policy then decides), the text it waits
+    to see, and whether the goal made it optional."""
+    def text(value):
+        return value if isinstance(value, str) and value.strip() else None
+
+    parsed = []
+    for st in steps or []:
+        if not isinstance(st, dict) or not isinstance(st.get("do"), str) or not st["do"].strip():
+            continue
+        # A label written as alternatives ("Online/Offline") is each of them.
+        labels = [part.strip() for label in st.get("labels") or [] if isinstance(label, str)
+                  for part in (label.split("/") if " " not in label.strip() else [label])]
+        step = {"do": st["do"].strip(), "labels": [label for label in labels if label][:4],
+                "text": text(st.get("text"))}
+        if tabs is not None:
+            step.update(tab=st.get("tab") if st.get("tab") in tabs else None, see=text(st.get("see")),
+                        optional=st.get("optional") is True)
+        parsed.append(step)
+    if len(parsed) > limit:
+        raise ValueError("Too many steps")
+    return parsed
+
+
+def plan_tabs(goal, tabs, attempts=3):
+    """Once per task with several tabs: ordered steps, each on a named tab. `tabs` maps each tab's name to the labels
+    it shows now. One call splits the goal into parts by tab, then one call per part lists its steps: a small local
+    model plans one tab's part far better than the whole goal. Credential references ({{NAME}}) stay references;
+    their values never reach the text model."""
+    def ask(system, context, key, parse):
+        for attempt in range(attempts):
+            try:
+                output, meta = chat_json(system, context, timeout=90)
+                result = parse(output.get(key) if isinstance(output, dict) else None)
+                if not result:
+                    raise ValueError("Goal planner returned no steps; no action executed.")
+                return result, meta
+            except ValueError as error:
+                if "TEXT_MODEL_API_KEY" in str(error) or attempt == attempts - 1:
+                    raise
+
+    def parts(value):
+        return [{"tab": p["tab"], "goal": p["goal"].strip()} for p in value or [] if isinstance(p, dict)
+                and p.get("tab") in tabs and isinstance(p.get("goal"), str) and p["goal"].strip()]
+
+    split, meta = ask(TAB_SPLIT, {"goal": goal, "tabs": list(tabs)}, "parts", parts)
+    steps, latency, calls = [], meta["latency_ms"], 1
+    for part in split:
+        context = {"goal": part["goal"], "fields_on_page": list(tabs[part["tab"]])[:30]}
+        found, step_meta = ask(TAB_STEPS, context, "steps", lambda value: parse_steps(value, list(tabs)))
+        steps += [{**step, "tab": part["tab"]} for step in found]
+        latency, calls = latency + step_meta["latency_ms"], calls + 1
+    if len(steps) > 40:
+        raise ValueError("Too many steps")
+    return {"requirements": [], "open": None, "finish": "Every step is done.", "steps": steps}, {
+        **meta, "latency_ms": latency, "calls": calls, "parts": split}
+
+
+def resolve_step(goal, step, controls):
+    """When no control's label names a step, the text model picks one observed control by index, or none.
+    `controls` maps index -> description. It returns an index from `controls` or None, never anything else."""
+    context = {"goal": goal, "step": step["do"], "text_to_type": step["text"], "controls": controls}
+    output, meta = chat_json(STEP_TARGET, context)
+    index = output.get("index") if isinstance(output, dict) else None
+    index = str(index) if isinstance(index, (int, str)) and not isinstance(index, bool) else None
+    return (index if index in controls else None), meta

@@ -211,6 +211,16 @@ def test_changed_field_context_does_not_reuse_generated_text(runner, monkeypatch
     assert helper.call_count == 2
 
 
+def test_before_act_runs_before_each_action_and_before_browser_input(runner):
+    calls = []
+    runner.before_act = lambda: calls.append(runner.state["browser"].act.call_count)
+    runner.state["decision"] = decision("e3")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    runner.state["decision"] = decision("wait")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert calls == [0, 1]
+
+
 def test_loading_waits_do_not_trigger_no_progress_stop(runner):
     for _ in range(5):
         runner.state["decision"] = decision("wait")
@@ -318,3 +328,25 @@ def test_navigation_during_prediction_reobserves_without_action(runner):
     assert runner.state["status"] == "ready"
     assert runner.state["decision"] is None
     runner.state["browser"].act.assert_not_called()
+
+
+def test_chat_widget_checks_come_from_browser_state():
+    from examples.chat_widget import verify
+
+    def probe(url, visible, texts, fields=()):
+        return {"step": 0, "url": url, "iframes": [{"id": "w", "src": "", "visible": visible, "has_content": True}],
+                "frame_texts": list(texts), "field_values": list(fields), "elements": []}
+
+    start = "https://example.test/page"
+    probes = [probe(start, False, []), probe(start, True, ["Type a message\nHello"], ["Hello"]),
+              probe(start, True, ["You\nHello", "Chat has ended!"]), probe(start, False, ["Chat has ended!"])]
+    result = verify(probes, ["Hello"], ended=True, gone=["Keypad"], closed=True)
+    assert result["passed"] and result["steps_with_text"] == {"Hello": [0]}  # the sent message, not the typed one
+    assert not verify(probes[:2], ["Hello"])["passed"]  # typed in the box is not sent
+    # Navigating away hides every widget; that is not closing one.
+    assert not verify(probes + [probe("https://docs.example.test/", False, [])], closed=True)["passed"]
+    assert "widget_closed" not in verify(probes)["checks"]  # only requested checks are applied
+    picker = probe(start, True, ["Pick an emoji...\n😀😃👍"])
+    assert not verify([probes[0], picker], ["😃"])["passed"]  # a picker's button is not a sent message
+    sent = {**picker, "frame_texts": ["You\n😃\n😀😃👍"]}
+    assert verify([probes[0], sent], ["😃"])["passed"]

@@ -256,6 +256,7 @@ dependencies = [
     { name = "browser-harness" },
     { name = "httpx", extra = ["http2"] },
     { name = "laya-mlx" },
+    { name = "websockets" },
 ]
 
 [package.dev-dependencies]
@@ -270,6 +271,7 @@ requires-dist = [
     { name = "browser-harness", specifier = "==0.1.13" },
     { name = "httpx", extras = ["http2"], specifier = ">=0.28,<1" },
     { name = "laya-mlx", specifier = ">=0.1,<0.2" },
+    { name = "websockets", specifier = ">=13" },
 ]
 
 [package.metadata.requires-dev]
@@ -284,7 +286,7 @@ name = "mlx"
 version = "0.32.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "mlx-metal", marker = "sys_platform == 'darwin'" },
+    { name = "mlx-metal" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/38/f7/5664e13821491559c953494e6705c818203d6880d713a0c22e12bead9564/mlx-0.32.2-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:77217798a2b036bae9f213b851d4cde4581893787c9964458b7d471f86036bd6", size = 619370, upload-time = "2026-08-25T10:31:44.235Z" },

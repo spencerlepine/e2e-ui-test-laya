@@ -5,6 +5,7 @@ import os
 import time
 from pathlib import Path
 
+from . import credentials
 from .browser import Browser, StalePage
 from .laya import LayaPolicy, laya
 from .model import action_space, choose, field_context, field_text
@@ -12,17 +13,32 @@ from .questions import MAX_STEPS
 
 
 class Agent:
-    def __init__(self, url, goals, *, record_dir=None, screenshots=False):
+    def __init__(self, url, goals, *, record_dir=None, screenshots=False, before_act=None, browser="chrome"):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
         plan = [task]
         self.pending_text = None
+        # Called before each action is carried out, after the plan exists (e.g. to start a recording just in time).
+        self.before_act = before_act
+        # Several named tabs, [(name, url), ...], are observed and driven as one page (tabs.py). Chrome only.
+        tabs = [name for name, _ in url] if isinstance(url, (list, tuple)) else None
+        if tabs and (browser == "firefox" or os.environ.get("DECISION_MODEL", "laya") != "laya"):
+            raise ValueError("Several tabs need Chrome (or Edge) and DECISION_MODEL=laya")
         # Local Laya decisions by default; DECISION_MODEL=typesafe keeps the hosted Jev policy.
-        self.policy = LayaPolicy(task) if os.environ.get("DECISION_MODEL", "laya") == "laya" else None
+        self.policy = LayaPolicy(task, tabs=tabs) if os.environ.get("DECISION_MODEL", "laya") == "laya" else None
         if self.policy:
             laya()  # Load and warm the local model before the task clock starts.
-        self.browser = Browser(url)
+        if tabs:
+            from .tabs import Tabs
+
+            self.browser = Tabs(url)
+        elif browser == "firefox":
+            from .firefox import FirefoxBrowser  # its own Firefox over WebDriver BiDi, launched for this run
+
+            self.browser = FirefoxBrowser(url)
+        else:
+            self.browser = Browser(url)  # Chrome, or Edge (Chromium) through its own test Edge; see browsers.py
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
         try:
@@ -78,7 +94,8 @@ class Agent:
             state["decision"] = None
             if state["status"] in {"done", "blocked"}:
                 raise ValueError("This run has stopped. Start a fresh demo.")
-            if len(state["decisions"]) >= MAX_STEPS * 2:
+            # Several tabs wait on each other through a backend (a chat offer, a reply), so waits are expected.
+            if len(state["decisions"]) >= MAX_STEPS * (20 if getattr(self.browser, "tabs", None) else 2):
                 raise ValueError("Reached the demo's model-call budget")
             policy = getattr(self, "policy", None)
             if policy:
@@ -87,6 +104,8 @@ class Agent:
                 if not planned:
                     state["goal_plan"] = policy.plan
                     state["text_calls"].append({**policy.plan_meta, "field": "goal plan", "value": policy.plan})
+                state["text_calls"].extend(policy.calls)
+                policy.calls.clear()
             else:
                 state["decision"] = choose(state["page"], state["goal"], state["history"])
             state["decisions"].append(
@@ -103,6 +122,8 @@ class Agent:
                 raise ValueError("Observe and choose before acting")
             # Consume once, before any mutation or model call. A retry cannot double-click.
             state["decision"] = None
+            if getattr(self, "before_act", None):
+                self.before_act()
             selected = decision["choice"]
             if selected in {"DONE", "BLOCKED"}:
                 if not state["browser"].fresh(page):
@@ -113,7 +134,8 @@ class Agent:
                 state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
                 return self.snapshot()
             action = next(a for a in page["actions"] if a["id"] == selected)
-            if len(state["history"]) >= MAX_STEPS:
+            # Waiting for a page to load or a control to appear does not use up the action budget.
+            if sum(h["kind"] != "wait" for h in state["history"]) >= MAX_STEPS:
                 state["status"] = "blocked"
                 raise ValueError(f"Stopped at the {MAX_STEPS}-action demo budget")
             text, helper = None, None
@@ -130,8 +152,9 @@ class Agent:
                     text, helper = field_text(context)
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
-            # Browser.act checks freshness immediately before input, including after text generation.
-            state["browser"].act(action, page, text=text)
+            # Browser.act checks freshness immediately before input, including after text generation. Credential
+            # references become their values only here; the decision, history and logs keep the reference.
+            state["browser"].act(action, page, text=credentials.prepare(text, action) if text is not None else None)
             self.pending_text = None
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             # Record execution before observing. A stale post-action observation must not erase the action.
@@ -151,6 +174,7 @@ class Agent:
                     "target": decision["target"],
                     "page_changed": None,
                     "url": page["url"],
+                    "tab": action.get("tab"),
                     "usage": decision["usage"],
                     "executed_ms": round((time.perf_counter() - state["started_at"]) * 1000),
                     "elapsed_ms": state["elapsed_ms"],

@@ -13,7 +13,8 @@ import time
 import unicodedata
 from urllib.parse import urlparse
 
-from .model import plan_goal, validate_choice
+from . import credentials
+from .model import plan_goal, plan_tabs, resolve_step, validate_choice
 
 DEFAULT_MODEL = "aac6fef/laya-typed-decisions-mlx"
 FIELD_ROLES = {"combobox", "textbox", "searchbox", "spinbutton", "checkbox", "radio", "switch"}
@@ -34,6 +35,18 @@ UNFINISHED = {
 }
 
 MAX_RESULT_WAITS = 12  # about 2 s of observation while submitted results load
+# Goals that are a sequence of steps on controls ("open the chat, start a call, end it, close it").
+CONFIRM_WORDS = {"yes", "confirm", "ok", "okay", "continue", "proceed", "accept", "allow", "agree", "send", "submit"}
+GUESS_AFTER = 3  # waits before the text model is asked which control performs a step no label names
+RESOLVE_CALLS = 3  # text-model calls per step at most; each new set of visible controls may need one
+MAX_STEP_WAITS = 24  # about 8 s for a step's control to appear; then the step is skipped
+# With several tabs, a control can wait on another tab through a backend (an agent accepts a customer's chat).
+TAB_STEP_WAITS = 90  # about 30 s for such a control to appear
+TAB_GUESS_AFTER = 15  # and about 5 s before the text model is asked, so it is not asked while the control is on its way
+SEE_WAITS = 150  # about 60 s for text a step waits to see (a reply sent from another tab)
+OPTIONAL_WAITS = 6  # an optional step ("log in if needed") whose control does not show is not needed
+SETTLE_WAITS = 10  # about 1.5 s for the page to react to a step before the step counts as having done nothing
+STEP_TRIES = 3  # a step whose click visibly did nothing is decided again (controls can show before they work)
 
 _MODEL = None
 
@@ -80,6 +93,8 @@ def observed(page):
                 "checked": action.get("checked"),
                 "expanded": action.get("expanded"),
                 "hint": action.get("hint", ""),
+                "tab": action.get("tab"),
+                "secret": bool(action.get("secret")),
                 "actions": {},
                 "options": [],
             }
@@ -109,13 +124,33 @@ def display(e):
     return f"{e['label'][:80]} ({e['hint'][:60]})" if e.get("hint") else e["label"][:80]
 
 
+def named(e, step):
+    """The control's label carries every word of one of the step's likely labels ("Call" in "Start a call"). A step
+    planned without labels, or a typing step, is also named by its own words ("type a message")."""
+    label = words(e["label"])
+    texts = step["labels"] + ([step["do"]] if step.get("do") and (step.get("text") or not step["labels"]) else [])
+    return any(w and w <= label for w in (words(text) for text in texts))
+
+
 def plannable(e):
     """Elements a requirement can name: fields, and buttons, which often open pickers for dates or counts."""
     return is_field(e) or e["role"] == "button"
 
 
+def mark(e):
+    """A control's identity across observations: its node and label. A running clock ("3 minutes 12 seconds") in a
+    label is not a new control."""
+    return e["node"], re.sub(r"\d+", "#", e["label"])
+
+
+def tab_text(page, tab):
+    """The visible text of one tab (several tabs observed as one page), or of the whole page."""
+    return next((t["text"] for t in page.get("tabs") or [] if t["name"] == tab), page["text"])
+
+
 def describe(e):
-    text = f"{e['role']} {e['label'][:70]}"
+    text = f"[{e['tab']}] " if e.get("tab") else ""
+    text += f"{e['role']} {e['label'][:70]}"
     if e.get("hint"):
         text += f" ({e['hint'][:50]})"
     if is_field(e) and e["current"] != e["label"]:
@@ -195,8 +230,9 @@ def shortlist(candidates, text, limit, bonus=None, top_tier=False, margin=1):
 
 
 class LayaPolicy:
-    def __init__(self, goal):
+    def __init__(self, goal, tabs=None):
         self.goal = goal
+        self.tabs = list(tabs) if tabs else None  # names of the tabs observed as one page
         self.plan = None
         self.plan_meta = None
         self.fields = {}  # requirement index -> observed node
@@ -215,6 +251,18 @@ class LayaPolicy:
         self.search_added = False
         self.frozen = set()  # requirements submitted to an earlier page
         self.failed = {}  # node -> decisions on it that could not execute
+        self.step = 0  # the next step of a step-by-step goal
+        self.used = set()  # marks of controls a step used; a later step never reuses them
+        self.opened = None  # the latest executed step, until a later action: it may still need confirming
+        self.base = set()  # marks of controls shown before the latest executed action
+        self.tries = {}  # step -> executions
+        self.resolved = {}  # (step, visible controls) -> the text model's answer
+        self.typing = None  # the latest typing step, until the page shows its text outside the field
+        self.sends = set()
+        self.confirmed = {}  # step -> label of the control that confirmed it (the Send a typed message revealed)
+        self.calls = []  # text-model calls made while choosing, for the run's model-call count
+        self.view = None  # the previous observation's controls and text, to act only on a settled page
+        self.proposed = None
 
     # Bookkeeping ---------------------------------------------------------------------------------------------
 
@@ -235,6 +283,22 @@ class LayaPolicy:
             if step["kind"] in {"submit", "item", "next"}:
                 self.tried[step["label"]] = self.tried.get(step["label"], 0) + 1
             self.waits = self.waits + 1 if step["kind"] == "wait" else 0
+            if step["kind"] in {"step", "confirm"}:
+                self.used.add(mark(step))
+            if step["kind"] == "step":
+                self.step = step["seq"] + 1
+                self.tries[step["seq"]] = self.tries.get(step["seq"], 0) + 1
+                # A credential cannot be read back from the page (a password never is), so it is not tracked.
+                text = self.plan["steps"][step["seq"]]["text"]
+                if text and not credentials.references(text):
+                    self.typing, self.sends = step, set()
+            if step["kind"] == "confirm" and self.typing:
+                self.sends.add(step["node"])  # a retry may press the same Send button again
+            if step["kind"] == "confirm" and self.opened:
+                self.confirmed[self.opened["seq"]] = step["label"]
+            if step["kind"] != "wait":
+                self.opened = step if step["kind"] == "step" else None
+                self.base = step["shown"]
             if step["kind"] != "wait":
                 self.acted = step["kind"]  # the latest non-wait step
         self.seen, self.pending = len(history), None
@@ -282,9 +346,21 @@ class LayaPolicy:
         elements = observed(page)
         if self.plan is None:
             labels = list(dict.fromkeys(display(e) for e in elements if plannable(e)))
-            self.plan, self.plan_meta = plan_goal(self.goal, labels)
+            if self.tabs:
+                self.plan, self.plan_meta = plan_tabs(self.goal, {tab: list(dict.fromkeys(
+                    display(e) for e in elements if plannable(e) and e["tab"] == tab)) for tab in self.tabs})
+            else:
+                self.plan, self.plan_meta = plan_goal(self.goal, labels)
+            # A step label copied from the page's own fields names that field only if the goal does too.
+            copied = {fold(label) for label in labels}
+            for step in self.plan.get("steps", []):
+                step["labels"] = [t for t in step["labels"]
+                                  if fold(t) not in copied or words(t) <= words(self.goal)]
         self.answers, self.questions, self.tokens = {}, {}, 0
-        op, element, action, picked, kind, req, text = self.decide(page, elements)
+        self.proposed = None
+        steps = self.plan.get("steps")
+        op, element, action, picked, kind, req, text = (
+            self.sequence(page, elements, steps) if steps else self.decide(page, elements))
         answer = picked[1] if picked else None
         indices = {str(e["node"]): e["index"] for e in elements}
         choice = action["id"] if action else {"DONE": "DONE", "BLOCKED": "BLOCKED"}.get(op, "wait")
@@ -295,7 +371,10 @@ class LayaPolicy:
         self.pending = {
             "choice": choice, "kind": kind, "req": req, "node": element["node"] if element else None,
             "url": page["url"], "before": {e["node"] for e in elements},
-            "label": element["label"] if element else None,
+            "label": element["label"] if element else None, "seq": self.proposed,
+            # Sites relabel a control in place ("Start a call" becomes "Yes, Start a call"): node and label.
+            "shown": {mark(e) for e in elements}, "tab": element["tab"] if element else None,
+            "tab_shown": {mark(e) for e in elements if element and e["tab"] == element["tab"]},
         }
         return {
             "choice": choice,
@@ -457,6 +536,165 @@ class LayaPolicy:
         if not picked:
             return "BLOCKED", None, None, None, "blocked", None, None
         return self.click(picked, "next", None)
+
+    def sequence(self, page, elements, steps):
+        """A goal that is a sequence of steps: do each in order on the control whose label names it, finish what
+        a step opens (a confirmation, a Send button), wait for controls that are still appearing, and skip a step
+        whose control never appears. With several tabs, each step acts only on its own tab. Every target is an
+        observed element."""
+        def here(tab):  # the controls of one tab (every control when the page is one tab)
+            return [e for e in elements if tab is None or e["tab"] == tab]
+
+        current = steps[self.step].get("tab") if self.step < len(steps) else None
+        view, self.view = self.view, ({mark(e) for e in here(current)},
+                                      re.sub(r"\d+", "#", tab_text(page, current)))
+        opened = self.opened
+        # Typed text is delivered once the page shows it outside its field (a sent message in a transcript). If it
+        # is in neither place, a reset or a send before the page was ready lost it: type it again.
+        if typing := self.typing:
+            text = fold(steps[typing["seq"]]["text"])
+            field = next((e for e in elements if e["node"] == typing["node"]), None)
+            in_field = bool(field) and text in fold(field["current"])
+            if (text in fold(tab_text(page, typing["tab"])) and not in_field) or (
+                    field is None and self.last is not typing):
+                self.typing = None  # shown, or a later step moved the form on and its field is gone
+            elif not in_field:
+                if self.waits < SETTLE_WAITS:  # it may still be rendering; later steps wait for it
+                    return "WAIT", None, None, None, "wait", None, None
+                self.typing = None
+                if self.tries.get(typing["seq"], 0) < STEP_TRIES:
+                    self.used = {u for u in self.used if u[0] not in {typing["node"], *self.sends}}
+                    self.step, self.opened, opened = typing["seq"], None, None
+        # Act on the page a step produced, not on the one it is still replacing ("End call" before the call
+        # screen closes).
+        if opened and {mark(e) for e in here(opened["tab"])} == opened["tab_shown"]:
+            if self.waits < SETTLE_WAITS:
+                return "WAIT", None, None, None, "wait", None, None
+            if self.tries.get(opened["seq"], 0) < STEP_TRIES:
+                # Nothing visibly happened: the control may have shown before it worked. Decide the step again.
+                self.used.discard(mark(opened))
+                self.step, self.opened, opened = opened["seq"], None, None
+        # Only a settled page: two observations in a row with the same controls and text on the step's tab.
+        if view != self.view:
+            return "WAIT", None, None, None, "wait", None, None
+        free = [e for e in elements if mark(e) not in self.used and self.failed.get(e["node"], 0) < 2]
+        clickable = [e for e in free if "click" in e["actions"]]
+        if opened:
+            done = steps[opened["seq"]]
+            # A confirmation repeats the label that named the clicked control ("End chat" asks "End chat?");
+            # another control sharing one of the step's looser labels ("Chat" in "Minimize Chat") does not.
+            # A control no label named (the text model chose it) opened choices: the most specific label names one.
+            naming = [t for t in done["labels"] if named({"label": opened["label"]}, {"labels": [t]})]
+            same = {"labels": [max(naming, key=lambda t: len(words(t)))] if naming else done["labels"][:1]}
+            # A confirmation is a button, never a text field ("Type a message and press enter to send").
+            new = [e for e in clickable if mark(e) not in opened["shown"] and e["tab"] == opened["tab"]
+                   and "fill" not in e["actions"] and (set(fold(e["label"]).split()) & CONFIRM_WORDS or named(e, same))]
+            # A choice the next step names belongs to that step (a menu opened to choose "Available" also lists the
+            # current "Offline", which repeats the label that opened it).
+            following = steps[opened["seq"] + 1] if opened["seq"] + 1 < len(steps) else None
+            if following and any(named(e, following) for e in clickable if mark(e) not in opened["shown"]):
+                new = []
+            picked = self.pick("confirm", new, f"Step: {done['do']}",
+                               f"Which option completes this step: {done['do']}?", " ".join(done["labels"]))
+            if picked:
+                return self.click(picked, "confirm", None)
+
+        def pool(s):
+            """The step's own tab. Text goes into fields; a password credential only into a password field."""
+            mine = [e for e in free if s.get("tab") is None or e["tab"] == s["tab"]]
+            if s["text"]:
+                return [e for e in mine if "fill" in e["actions"] and e["secret"] == credentials.secret(s["text"])]
+            return [e for e in mine if "click" in e["actions"]]
+
+        patience, guess = (TAB_STEP_WAITS, TAB_GUESS_AFTER) if self.tabs else (MAX_STEP_WAITS, GUESS_AFTER)
+        while self.step < len(steps):
+            i, s = self.step, steps[self.step]
+            if s.get("see"):
+                # A step that waits for text to appear on its tab (a reply sent from another tab).
+                if fold(s["see"]) in fold(tab_text(page, s.get("tab"))):
+                    self.step, self.waits = i + 1, 0
+                    continue
+                if self.waits < SEE_WAITS:
+                    return "WAIT", None, None, None, "wait", None, None
+                self.step, self.waits = i + 1, 0  # it never appeared; the run's own checks report it
+                continue
+            about = f"{s['do']} {' '.join(s['labels'])}"
+            question = f"Which element should be used to {s['do']}?"
+            picked = None
+            later = [t for t in steps[i + 1:] if t.get("tab") == s.get("tab") and not t.get("see")]
+            if i - 1 in self.confirmed and named({"label": self.confirmed[i - 1]}, s):
+                # The previous step's confirmation was this step's control ("send it" after the Send that typing
+                # revealed was pressed): already done.
+                self.step, self.waits = i + 1, 0
+                continue
+            if exact := [e for e in pool(s) if named(e, s)]:
+                picked = self.pick(f"step_{i}", exact, f"Step: {s['do']}", question, about)
+            elif s.get("optional"):
+                # Only needed when its own control shows ("log in if needed"). A later step's control on the same
+                # tab, or none after a short wait, means it is not needed. The text model never guesses one.
+                if self.waits >= OPTIONAL_WAITS or any(named(e, t) for t in later for e in pool(t)):
+                    self.step, self.waits = i + 1, 0
+                    continue
+            elif not s["text"] and (ahead := self.ahead(i, steps, pool)) is not None:
+                # A later step's control appeared since the last action, so this step has none of its own
+                # ("start a conversation" can begin by itself once a chat opens). A control that was already
+                # there (a Minimize button) says nothing: the current step's control may still be loading.
+                # A step with text to type is never skipped this way: the text is part of the goal.
+                self.step, self.waits = ahead, 0
+                continue
+            elif self.waits >= guess:
+                # No label names it: the text model reads the step and the visible controls. It never takes a
+                # control that another step names.
+                others = [t for t in steps if t is not s]
+                picked = self.resolve(i, s, [e for e in pool(s) if not any(named(e, t) for t in others)])
+            if picked:
+                self.proposed, e = i, picked[0]
+                if s["text"]:
+                    return "TYPE_TEXT", e, e["actions"]["fill"], picked, "step", None, s["text"]
+                return self.click(picked, "step", None)
+            if self.waits < patience:
+                return "WAIT", None, None, None, "wait", None, None
+            self.step, self.waits = i + 1, 0  # its control never appeared
+        return "DONE", None, None, None, "done", None, None
+
+    def ahead(self, i, steps, pool):
+        """The later step whose control appeared since the last action, if any. On one page only the next step
+        counts. With several tabs, a backend can make the goal move on by itself (a chat offer arrives while the
+        agent is already available), so any later step on the same tab counts, up to one that types or waits."""
+        for j in range(i + 1, len(steps)):
+            t = steps[j]
+            if t.get("see") or t.get("tab") != steps[i].get("tab"):
+                return None
+            if any(named(e, t) and mark(e) not in self.base for e in pool(t)):
+                return j
+            if not self.tabs or t["text"]:
+                return None
+        return None
+
+    def resolve(self, i, step, candidates):
+        """Ask the text model once per step and set of visible controls (at most RESOLVE_CALLS per step). Any
+        failure is an answer of none: the step keeps waiting and is skipped if its control never appears."""
+        key = (i, frozenset(mark(e) for e in candidates))
+        if key not in self.resolved:
+            if not candidates or sum(k[0] == i for k in self.resolved) >= RESOLVE_CALLS:
+                return None
+            # Only controls sharing a word with the step: a guess with nothing in common ("Start a call" to send a
+            # reply, a code editor to type a message) did the wrong thing. Pickers can offer hundreds: keep 60.
+            about = f"{step['do']} {' '.join(step['labels'])}"
+            likely = shortlist([e for e in candidates if relevance(e, about)], about, 60)
+            if not likely:
+                self.resolved[key] = None
+                return None
+            controls = {e["index"]: describe(e) for e in likely}
+            try:
+                index, meta = resolve_step(self.goal, step, controls)
+                self.calls.append({**meta, "field": f"step: {step['do']}", "value": index})
+            except (ValueError, RuntimeError, KeyError, TypeError):
+                index = None
+            # Remember the control itself: indices shift when the page changes during a slow model call.
+            self.resolved[key] = next((mark(e) for e in likely if e["index"] == index), None)
+        chosen = self.resolved[key] or next((v for k, v in self.resolved.items() if k[0] == i and v), None)
+        return next(((e, None) for e in candidates if mark(e) == chosen), None)
 
     def click(self, picked, kind, req):
         e = picked[0]
